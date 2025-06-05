@@ -1,0 +1,375 @@
+#!/usr/bin/env Rscript
+rm(list = ls())
+################################################################################
+# SEPAGES - AirPollution->DNAm->LF-2m Mediation analyses using HDMax2 
+################################################################################
+# Author: Lucile
+# Date: 26/01/2024
+################################################################################
+# Notes:
+# - No missing data allowed for HDMAX2
+# 1: CpG-wise analysis then restrict to reliable probes
+# 1': Estimation of overall effects (on CpGs only)
+# 32: AMR analysis based on all CpGs
+################################################################################
+# Paths and parameters
+#------------------------------------------------------------------------------#
+
+# Methylation data (pre-processed; Rscript 0-PreprocessingDNAme.R)
+methFile <- "Data/DNAmethylplacenta_adjfunnorm_preprocessed.rds"
+
+metaFile <- "Data/SEP_metaData_imp_2m.rds"
+
+expoFile <- "Data/SEP_AirPollutionData.rds"
+
+probevarFile <- "Data/SEP_ProbeVariation_PRadj.rds"
+
+annotFile.epic <- "Data/IlluminaHumanMethylationEPICanno+Homo_sapiens.GRCh38.104.rds"
+
+K <- 6 # Number of latent factors to compute and adjust for
+
+sims <- 1000 # Number of simulations in wrap_mediation
+nboots <- 1000 # Number of bootstrap (mediation::mediate)
+
+outPath <-  "Results/"
+
+runAMR <- TRUE # whether to run AMR analysis as well
+
+seed <- 38
+
+################################################################################
+# Set seed (simulation)
+#------------------------------------------------------------------------------#
+
+set.seed( seed )
+
+################################################################################
+# R packages
+#------------------------------------------------------------------------------#
+
+library(magrittr)
+library(data.table)
+
+# Load mediation function adapted from hdmax2
+source("~/Work/AirP-DNAm-FV/Rscripts/Rfunctions.R")
+
+################################################################################
+# R functions
+#------------------------------------------------------------------------------#
+
+# Transform categorical columns into numeric dummy covariate(s)
+# For lfmm
+CatAsDummy <- function(df){
+  
+  for(i in 1:ncol(data.frame(df))){
+    
+    x <- fastDummies::dummy_cols(.data = data.frame(df[,i]), 
+                                 remove_first_dummy = T, 
+                                 remove_selected_columns = T)
+    colnames(x) <- paste(colnames(df)[i], 1:ncol(x), sep = "_")
+    if(i == 1){
+      df.res <- x 
+    }else{
+      df.res <- cbind.data.frame(df.res, x)
+    }
+  }
+  return( df.res )
+}
+
+################################################################################
+# Load annotation
+#------------------------------------------------------------------------------#
+
+FullAnnot <- readRDS(annotFile.epic)
+
+################################################################################
+# Reliable probes
+#------------------------------------------------------------------------------#
+
+probeVar <- readRDS(probevarFile)
+selectedProbes <- dplyr::filter(probeVar,indiv>error+grouping)$CpG
+
+length(selectedProbes)
+# 437964
+
+################################################################################
+# Other data : Exposure, Covariates, Outcomes
+#------------------------------------------------------------------------------#
+
+exposure.names <- c("PM25_perso", "DTTv", "AAv", "NO2_perso",
+                    "NO2_p","PM25_p", "PM10_p")
+
+outcome.names <- c("LCI","FRC","TV","RR","tPTEF_tE", "MinVent")
+
+################################################################################
+# Model (Med1) M = X + covar_xm regression
+# covar_xm including only prenatal covariates
+#------------------------------------------------------------------------------#
+
+continuous_covariates.xm <- c("MaternalAge", 
+                              "MaternalBMI",
+                              "EDI")
+
+categorical_covariates.xm <- c("ChildSex", 
+                               "MaternalSmoking", 
+                               "Parity", 
+                               "ParentalEducation")
+
+confounders1 <- c(continuous_covariates.xm,
+                  paste0(categorical_covariates.xm, "_", "1"))
+
+################################################################################
+# Model (Med2) Y = X + M + covar_xmy regression, 
+# covar_xmy including prenatal and postnatal covariates
+#------------------------------------------------------------------------------#
+
+continuous_covariates.xmy <- c("MaternalAge", 
+                               "MaternalBMI", 
+                               "EDI",
+                               "ChildLength.2m")
+
+categorical_covariates.xmy <- c("ChildSex", 
+                                "MaternalSmoking", 
+                                "Parity", 
+                                "ChildPassiveSmoking.12m",
+                                "ParentalEducation",
+                                "ParentalRhinitis",
+                                "SeasonConception")
+
+confounders2 <- c(continuous_covariates.xmy,
+                  paste0(categorical_covariates.xmy, "_", "1"),
+                  "SeasonConception_2",
+                  "SeasonConception_3")
+
+################################################################################
+# Load methylation data
+#------------------------------------------------------------------------------#
+
+meth.all <- readRDS(methFile)
+dim(meth.all)
+#755365    395
+
+################################################################################
+# Preparing PHENO data
+# categorical data must be numeric
+#------------------------------------------------------------------------------#
+
+for(exposure.name in exposure.names){
+  
+  cat("Testing:", exposure.name, "\n")
+  
+  results <- data.frame()
+  est_oie <- list()
+  res.dmr_cpg <- data.frame()
+  res.dmr <- data.frame()
+  
+  outFile1 <- paste0(outPath, "/hdmax2/", "hdmax2_cpg_", exposure.name, ".rds")
+  outFile3 <- paste0(outPath, "/hdmax2/", "hdmax2_cpgEstOie_", exposure.name, ".rds")
+  outFile2 <- paste0(outPath, "/hdmax2/", "hdmax2_cpgInDmrs_", exposure.name, ".rds")
+  outFile4 <- paste0(outPath, "/hdmax2/", "hdmax2_dmrs_", exposure.name, ".rds")
+  
+  for(outcome.name in outcome.names){
+    
+    ################################################################################
+    # Load metaData
+    #------------------------------------------------------------------------------#
+    
+    metaData <- readRDS(metaFile)
+    
+    if(exposure.name %in% c("PM25_perso", "NO2_perso", "DTTv", "AAv")){
+      metaData <- merge(metaData, readRDS(expoFile)[,c("id", exposure.name)], by = "id")
+    }
+    
+    metaData <- metaData %>% dplyr::filter(id %in% colnames(meth.all))
+    nrow(metaData)
+    # 395 
+    
+    metaData <- metaData[,c("id", union(categorical_covariates.xm, categorical_covariates.xmy),
+                            union(continuous_covariates.xm,continuous_covariates.xmy),
+                            exposure.name, outcome.name)]
+    
+    metaData <- metaData[complete.cases(metaData),]
+    
+    PHENO <- cbind.data.frame(id = metaData$id,
+                              CatAsDummy(metaData[,union(categorical_covariates.xm, categorical_covariates.xmy)]),
+                              metaData[,union(continuous_covariates.xm,continuous_covariates.xmy)],
+                              metaData[,c(exposure.name,outcome.name)])
+    
+    meth <- meth.all[,as.character(PHENO$id)]
+    
+    ################################################################################
+    stopifnot(identical(colnames(meth),as.character(PHENO$id)))
+    ################################################################################
+    
+    ################################################################################
+    ## Mediation analysis using HDMax2
+    #------------------------------------------------------------------------------#
+    
+    # set of confounders for model 1 should be nested in set of confounders for model 2
+    stopifnot(length(setdiff(confounders1,confounders2)) == 0)
+    
+    res <- mEWAS2(X = PHENO[,exposure.name], 
+                  Y = PHENO[,outcome.name], 
+                  M = t(meth), 
+                  K = K, 
+                  conf1 = PHENO[,confounders1], 
+                  conf2 = PHENO[,confounders2])
+    
+    colnames(res$U) <- paste0("LF", 1:ncol(res$U))
+    rownames(res$U) <- colnames(meth)
+    
+    ################################################################################
+    ## Run max2 and mediation for reliable probes
+    #------------------------------------------------------------------------------#
+    
+    res2 <- Lu_max2(pval1 = res$pValue[selectedProbes, 1], 
+                    pval2 = res$pValue[selectedProbes, 2])
+    summary(res2$qval)
+    
+    save(res,res2, 
+         file = paste0("resEWAS/resEWAS-", exposure.name, "-", outcome.name, ".RData"))
+    
+    result <- res2$qval[res2$qval<0.2]
+    
+    if(length(result)>0){ #IF any hit
+      
+      result <- data.frame(Exposure = exposure.name, 
+                           Outcome = outcome.name, 
+                           N = ncol(meth),
+                           CpG = names(result),
+                           qval = result)
+      
+      res.med <- Lu_wrap_mediation(qval = res2$qval, 
+                                   X = PHENO[,exposure.name], 
+                                   Y = PHENO[,outcome.name], 
+                                   M = t(meth[selectedProbes,]), 
+                                   U = res$U,
+                                   conf1 = PHENO[,confounders1], 
+                                   conf2 = PHENO[,confounders2],
+                                   FDR = 0.2, 
+                                   sims = sims,
+                                   seed = seed)
+      
+      if(length(result$CpG)>1){
+        est_oie[[length(est_oie)+1]] <- est_oie2(X = PHENO[,exposure.name], 
+                                                 m = t(meth[result$CpG,]), 
+                                                 Y = PHENO[,outcome.name], 
+                                                 C1 = PHENO[,confounders1], 
+                                                 C2 = PHENO[,confounders2], 
+                                                 U = res$U, 
+                                                 boots = 1000,
+                                                 seed = seed)
+        
+        names(est_oie)[length(est_oie)] <- outcome.name
+      }
+      
+      for(name in c("ACME","ADE","PM","TE", "xm", "my")){
+        colnames(res.med[[name]])[1:4] <- paste0(colnames(res.med[[name]][1:4]),'.',name)
+        result <- merge(result, res.med[[name]], by = "CpG")
+      }
+      results <- rbind.data.frame(results, result)
+      #print(results)
+      
+    }#IF any hit
+    
+    ################################################################################
+    gc()
+    ################################################################################
+    
+    ################################################################################
+    ## Run max2 and AMR detection for all probes
+    #------------------------------------------------------------------------------#
+    
+    if(runAMR){
+      
+      res2.amr <- Lu_max2(pval1 = res$pValue[, 1], pval2 = res$pValue[, 2])
+      summary(res2.amr$qval)
+      
+      annot.tmp <- FullAnnot %>% dplyr::filter(CpG %in% rownames(meth))
+      rownames(annot.tmp) <- annot.tmp$CpG
+      annot.tmp <- annot.tmp[rownames(meth),]
+      
+      stopifnot(identical(annot.tmp$CpG, rownames(meth)))
+      
+      res.amr <- hdmax2::AMR_search(chr = annot.tmp$chr, 
+                                    start = annot.tmp$pos,
+                                    end = annot.tmp$pos,
+                                    pval = res2.amr$pval, 
+                                    cpg = annot.tmp$CpG)
+      
+      res.amr <- hdmax2::AMR_build(res.amr,methylation = t(meth), nb_cpg = 3)
+      
+      for(i in seq_along(res.amr$res$DMR)){
+        x <- annot.tmp %>% dplyr::filter(CpG %in% res.amr$CpG_for_each_AMR[[i]])
+        rownames(x) <- NULL
+        res.dmr_cpg <- rbind.data.frame(res.dmr_cpg, data.frame(Exposure = exposure.name,
+                                                                Outcome = outcome.name,
+                                                                DMR = res.amr$res[i,],x))
+      }
+      
+      res.amr <- Lu_wrap_mediation_AMR(X = PHENO[,exposure.name], 
+                                       Y = PHENO[,outcome.name], 
+                                       AMR = res.amr$AMR_mean, 
+                                       conf1 = PHENO[,confounders1], 
+                                       conf2 = PHENO[,confounders2],
+                                       U = res$U, 
+                                       sims = sims)
+      
+      res <- data.frame(Exposure = exposure.name, 
+                        Outcome = outcome.name, 
+                        DMR = res.amr$ACME$DMR)
+      
+      for(name in c("ACME","ADE","PM","TE", "xm", "my")){
+        colnames(res.amr[[name]])[1:4] <- paste0(colnames(res.amr[[name]][1:4]),'.',name)
+        res <- merge(res, res.amr[[name]], by = "DMR")
+      }
+      
+      res.dmr <- rbind.data.frame(res.dmr, data.frame(res))
+      print(res)
+      
+    }    
+    
+  }# END loop on outcomes
+  
+  if(!is.null(dim(results)) & nrow(results)>0){
+    
+    ################################################################################
+    ## Annotate sig. hits
+    #------------------------------------------------------------------------------#
+    
+    results <- merge(results, FullAnnot, by = "CpG")
+    results <- merge(results, probeVar, by = "CpG")
+    results <- results %>% dplyr::arrange(Exposure,Outcome)
+    
+    ################################################################################
+    ## Save
+    #------------------------------------------------------------------------------#
+    
+    saveRDS(results, file = outFile1)
+    saveRDS(est_oie, file = outFile3)
+    
+  }
+  
+  if(runAMR){
+    
+    ################################################################################
+    ## Add probe variance decomposition to DMR results
+    #------------------------------------------------------------------------------#
+    
+    res.dmr_cpg <- merge(res.dmr_cpg, probeVar, by = "CpG", all.y = F)
+    res.dmr_cpg <- res.dmr_cpg %>% dplyr::arrange(Exposure,Outcome)
+    
+    res.dmr_cpg %>% print()
+    
+    ################################################################################
+    ## Save
+    #------------------------------------------------------------------------------#
+    
+    saveRDS(res.dmr_cpg, file = outFile2)
+    saveRDS(res.dmr, file = outFile4)
+    
+  }
+  
+}# END loop on exposures
+
+################################################################################
