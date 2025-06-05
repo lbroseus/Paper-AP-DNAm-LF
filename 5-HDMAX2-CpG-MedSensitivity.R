@@ -1,0 +1,275 @@
+#!/usr/bin/env Rscript
+rm(list = ls())
+################################################################################
+# SEPAGES - AirPollution->DNAm->LF-2m - SA of results from hdmax2 (using medsens)
+################################################################################
+# Author: Lucile
+# Date: 06/01/2025
+################################################################################
+# Notes:
+# Help for the interpretation
+# https://pmc.ncbi.nlm.nih.gov/articles/PMC5124624/
+################################################################################
+# Paths and parameters
+#------------------------------------------------------------------------------#
+
+# Methylation data (pre-processed; Rscript 0-PreprocessingDNAme.R)
+methFile <- "Data/DNAmethylplacenta_adjfunnorm_preprocessed_autosomes.rds"
+
+metaFile <- "Data/SEP_metaData_imp_2m.rds"
+
+expoFile <- "Data/SEP_AirPollutionData.rds"
+
+probevarFile <- "Data/SEP_ProbeVariation_PRadj.rds"
+
+K <- 6
+
+sims <- 1000 # Number of simulations in wrap_mediation
+
+
+outFile <-  "SA/results_medsens_20250106.rds"
+
+################################################################################
+# Set seed (simulation)
+#------------------------------------------------------------------------------#
+
+set.seed(38)
+
+################################################################################
+# R packages
+#------------------------------------------------------------------------------#
+
+library(magrittr)
+library(data.table)
+#library(hdmax2)
+
+source("Rscripts/Rfunctions.R")
+
+################################################################################
+# R functions
+#------------------------------------------------------------------------------#
+
+# Transform categorical columns into numeric dummy covariate(s)
+# For lfmm
+CatAsDummy <- function(df){
+  
+  for(i in 1:ncol(data.frame(df))){
+    
+    x <- fastDummies::dummy_cols(.data = data.frame(df[,i]), 
+                                 remove_first_dummy = T, 
+                                 remove_selected_columns = T)
+    colnames(x) <- paste(colnames(df)[i], 1:ncol(x), sep = "_")
+    if(i == 1){
+      df.res <- x 
+    }else{
+      df.res <- cbind.data.frame(df.res, x)
+    }
+  }
+  return( df.res )
+}
+
+################################################################################
+# Exposures and outcomes
+#------------------------------------------------------------------------------#
+
+exposure.names <- c("NO2_p","PM25_p", "PM10_p", 
+                    "NO2_perso", "PM25_perso", 
+                    "DTTv", "AAv")
+
+outcome.names <- c("LCI","FRC","TV","RR","MinVent", "tPTEF_tE")
+
+################################################################################
+# Model (Med1) M = X + covar_xm regression
+# covar_xm including only prenatal covariates
+#------------------------------------------------------------------------------#
+
+continuous_covariates.xm <- c("MaternalAge", 
+                              "MaternalBMI",
+                              "EDI")
+
+categorical_covariates.xm <- c("ChildSex", 
+                               "MaternalSmoking", 
+                               "Parity", 
+                               "ParentalEducation")
+
+confounders1 <- c(continuous_covariates.xm,
+                  paste0(categorical_covariates.xm, "_", "1"))
+
+################################################################################
+# Model (Med2) Y = X + M + covar_xmy regression, 
+# covar_xmy including prenatal and postnatal covariates
+#------------------------------------------------------------------------------#
+
+continuous_covariates.xmy <- c("MaternalAge", 
+                               "MaternalBMI", 
+                               "EDI",
+                               "ChildLength.2m")
+
+categorical_covariates.xmy <- c("ChildSex", 
+                                "MaternalSmoking", 
+                                "Parity", 
+                                "ChildPassiveSmoking.12m",
+                                "ParentalEducation",
+                                "ParentalRhinitis",
+                                "SeasonConception")
+
+confounders2 <- c(continuous_covariates.xmy,
+                  paste0(categorical_covariates.xmy, "_", "1"),
+                  "SeasonConception_2",
+                  "SeasonConception_3")
+
+################################################################################
+# Load methylation data
+#------------------------------------------------------------------------------#
+
+meth.all <- readRDS(methFile)
+dim(meth.all)
+#755365    395
+
+################################################################################
+# Compute sensitivity parameters
+#------------------------------------------------------------------------------#
+
+results.medsens <- data.frame()
+
+for(exposure.name in exposure.names){
+  
+  ################################################################################
+  # Load results from hdmax2
+  #------------------------------------------------------------------------------#
+  
+  inFile.hdmax2 <- paste0("hdmax2/hdmax2_cpg_", exposure.name, ".rds")
+  
+  if(file.exists(inFile.hdmax2)){
+  
+    results <- readRDS(inFile.hdmax2)
+    
+    for(outcome.name in outcome.names){
+      
+      # Results for the current outcome
+      
+      res.outcome <- results %>% dplyr::filter(Outcome == outcome.name) 
+      
+      if(nrow(res.outcome)>0){
+  
+      ################################################################################
+      # Load metaData
+      #------------------------------------------------------------------------------#
+      
+      metaData <- readRDS(metaFile)
+      
+      if(exposure.name %in% c("PM25_perso", "NO2_perso", "DTTv", "AAv")){
+        metaData <- merge(metaData, readRDS(expoFile)[,c("id", exposure.name)], by = "id")
+      }
+     
+      metaData <- metaData %>% dplyr::filter(id %in% colnames(meth.all))
+      dim(metaData)
+      # 395  49
+      
+      metaData <- metaData[,c("id", union(categorical_covariates.xm, categorical_covariates.xmy),
+                              union(continuous_covariates.xm,continuous_covariates.xmy),
+                              exposure.name, outcome.name)]
+      
+      metaData <- metaData[complete.cases(metaData),]
+      
+      PHENO <- cbind.data.frame(id = metaData$id,
+                                CatAsDummy(metaData[,union(categorical_covariates.xm, categorical_covariates.xmy)]),
+                                metaData[,union(continuous_covariates.xm,continuous_covariates.xmy)],
+                                metaData[,c(exposure.name,outcome.name)])
+    
+      ################################################################################
+      # Load Rdata (results from the two models for mediation)
+      #------------------------------------------------------------------------------#
+      
+      inFile.dat <- paste0("resEWAS/resEWAS-",
+                           exposure.name, "-", outcome.name,".RData")
+      
+      load(inFile.dat) # res
+      
+      PHENO <- merge(PHENO, data.frame(id = rownames(res$U), res$U), by = "id")
+      
+      meth <- meth.all[,as.character(PHENO$id)]
+      
+      ################################################################################
+      stopifnot(identical(colnames(meth),as.character(PHENO$id)))
+      ################################################################################
+  
+      ################################################################################
+      ## Run max2 and mediation for reliable probes
+      #------------------------------------------------------------------------------#
+  
+      result <- data.frame(CpG = res.outcome$CpG,
+                           Exposure = exposure.name, 
+                           Outcome = outcome.name,
+                           rho.acme = NA, rho.ade = NA,
+                           R2star.acme = NA, R2tilde.acme = NA,
+                           R2star.ade = NA, R2tilde.ade = NA)
+      
+      for(c in seq_along(result$CpG)){
+        
+        PHENO$Mi <- meth[result$CpG[c],]
+  
+        formula1 <- stats::as.formula(paste0("Mi ~ ", exposure.name, "+",
+                                         paste0(c(confounders1, paste0("LF", 1:ncol(res$U))), collapse = "+")))
+        
+        mod1 <- stats::lm(formula = formula1, data = PHENO)
+        
+        formula2 <- stats::as.formula(paste0(outcome.name, " ~ ", 
+                                         exposure.name, 
+                                         "+ Mi +",
+                                         paste0(c(confounders2, paste0("LF", 1:ncol(res$U))), collapse = "+")))
+        
+        mod2 <- stats::lm(formula = formula2, data = PHENO) 
+        
+        set.seed(38)
+        med <- mediation::mediate(model.m = mod1, 
+                                  model.y = mod2, 
+                                  sims = sims, 
+                                  treat = exposure.name, 
+                                  mediator = "Mi")
+        
+        res.medsens <- mediation:: medsens(x = med, 
+                                           rho.by = 0.025, 
+                                           sims = sims,
+                                           eps = sqrt(.Machine$double.eps), 
+                                           effect.type = "both")
+        x <- summary(res.medsens)
+        result$rho.acme[c] <- x$err.cr.d
+        result$rho.ade[c] <- x$err.cr.z
+        
+        result$R2star.acme[c] <- x$R2star.d.thresh
+        result$R2tilde.acme[c] <- x$R2tilde.d.thresh
+        
+        result$R2star.ade[c] <- x$R2star.z.thresh
+        result$R2tilde.ade[c] <- x$R2tilde.z.thresh
+      }
+      
+      ################################################################################
+      gc()
+      ################################################################################
+      
+      results.medsens <- rbind.data.frame(results.medsens, result)
+      
+    }# END loop on outcomes
+    }
+  
+}
+}# END loop on exposures
+
+dim(results.medsens)
+
+################################################################################
+## Merge with hdmax results
+#------------------------------------------------------------------------------#
+
+#results.comball.full <- merge(results, results.comball, by = "CpG")
+
+#dim(results.comball.full)
+
+################################################################################
+## Save
+#------------------------------------------------------------------------------#
+
+saveRDS(results.medsens, file = outFile)
+
+################################################################################
