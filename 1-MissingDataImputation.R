@@ -55,7 +55,7 @@ dim(metaData)
 #------------------------------------------------------------------------------#
 
 outcomes <- c("LCI", "FRC", "TV", "RR", "MinVent", "MVperWe", "tPTEF_tE")
-exposures <- c("NO2_perso", "PM25_perso")
+exposures <- c("NO2_p", "PM25_p", "PM10_p")
 
 continuous_covariates <- c("MaternalAge", 
                            "MaternalSmoking_avgr",
