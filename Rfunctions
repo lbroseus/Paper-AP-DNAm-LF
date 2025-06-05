@@ -1,0 +1,357 @@
+################################################################################
+# AirPollution->DNAm->LungFunction | Mediation analysis
+################################################################################
+# Author: Lucile
+# Date: 01/12/2023
+################################################################################
+# Functions modified from hdmax2
+# Functions to deal with probe annotation
+################################################################################
+# R packages
+#------------------------------------------------------------------------------#
+
+#library(GenomicFeatures)
+
+################################################################################
+# mEWAS
+# Changes:
+# ->Latent factors: those computed for model 1
+#------------------------------------------------------------------------------#
+
+# conf1 = xm confounding factors
+# conf2 = xmy confounding factors
+mEWAS2 <- function(X, Y, M, K, conf1 = NULL, conf2 = NULL) {
+  #Epigenome Wide Association Study with both exposure and outcome
+  res <- list()
+  #No NAs
+  na = !is.na(X) & !is.na(Y)
+  for (col in colnames(conf1)){
+    na = na & !is.na(conf1[, col])
+  }
+  for (col in colnames(conf2)){
+    na = na & !is.na(conf2[, col])
+  }
+  if (length(na[!na]) > 0){
+    X = X[na]
+    Y = Y[na]
+    M = M[na,]
+    conf1 = conf1[na,]
+    conf2 = conf2[na,]
+    cat(paste('NA...', length(na[!na]), 'rows ignored\n'))
+  }
+  
+  # First regression
+  dat <- lfmm::lfmm_ridge(Y = M, X = cbind(X, conf1), K = K)
+  res[[1]] <- dat
+  #  # ajout
+  U <- dat$U
+  dat <- lfmm::lfmm_test(Y = M, X = cbind(X, conf1), lfmm = dat)
+  
+  pv1 <- dat$pvalue[, 1]
+  sc1 <- dat$score[, 1]
+  
+  sc1.cal <- dat$calibrated.score2[, 1]
+  pv1.cal <- dat$calibrated.pvalue[, 1]
+  
+  gif1 <- dat$gif[1]
+  
+  # Second regression
+  dat <- lfmm::lfmm_ridge(Y = M, X = cbind(X, Y, conf2), K = K)
+  res[[2]] <- dat
+  # ajout
+  #U2 <- dat$U
+  dat <- lfmm::lfmm_test(Y = M, X = cbind(X, Y, conf2), lfmm = dat)
+  
+  pv2 <- dat$pvalue[, 2]
+  sc2 <- dat$score[, 2]
+  
+  sc2.cal <- dat$calibrated.score2[, 2]
+  pv2.cal <- dat$calibrated.pvalue[, 2]
+  
+  gif2 <- dat$gif[2]
+  
+  names(res) <- c("mod1", "mod2")
+  
+  return(list(score = cbind(sc1, sc2),
+              pValue = cbind(pv1, pv2),
+              calibrated.score2 = cbind(sc1.cal, sc2.cal),
+              calibrated.pvalue = cbind(pv1.cal, pv2.cal),
+              gif = c(gif1, gif2),
+              U = U,
+              lfmm = res))
+}
+
+################################################################################
+# Lu_wrap_mediation
+# Run mediation (only 3 simulations for estimate and test indirect effect)
+# Mediation analyses with:
+# - two sets of covariates (may differ between M1 and M2) conf1 and conf2 resp.
+# - one set of latent factors U
+# - correction tau0 -> tau
+#------------------------------------------------------------------------------#
+
+Lu_wrap_mediation <- function(qval, 
+                              X, Y, M, 
+                              U = NULL,
+                              conf1 = NULL, 
+                              conf2 = NULL,
+                              FDR = 0.1, 
+                              sims = 1000,
+                              seed = NULL) {
+  
+  if (is.null(colnames(M))) {
+    colnames(M) <- 1:ncol(M)
+  }
+  
+  col <- colnames(M)
+  M <- as.matrix(M[, qval <= FDR])
+  colnames(M) <- col[qval <= FDR]
+  
+  # from package mediation
+  ACME <- matrix(ncol = 4, nrow = ncol(M))
+  ADE <- matrix(ncol = 4, nrow = ncol(M))
+  PM <- matrix(ncol = 4, nrow = ncol(M))
+  TE <- matrix(ncol = 4, nrow = ncol(M))
+  
+  # from linear models
+  xm <- matrix(ncol = 4, nrow = ncol(M))
+  my <- matrix(ncol = 4, nrow = ncol(M))
+  
+  for (i in 1:ncol(M)) {
+    
+    dat.x <- data.frame(X = X, Mi = M[, i], covar = cbind(conf1,U))
+    dat.y <- data.frame(X = X, Mi = M[, i], covar = cbind(conf2,U), Y = Y)
+    
+    mod1 <- stats::lm(Mi ~ X + ., data = dat.x)
+    mod2 <- stats::lm(Y ~ X + Mi + ., data = dat.y) 
+    # mod2 <- stats::glm(Y ~ X + Mi + ., data = dat.y, family = binomial) # changed for logistic regression
+    
+    # for linear models
+    xm[i, ] <- summary(mod1)$coeff[2, ] # effect of X
+    my[i, ] <- summary(mod2)$coeff[3, ] # effect of M
+    
+    if(!is.null(seed)) set.seed(seed)
+    med <- mediation::mediate(mod1, mod2, sims = sims, treat = "X", mediator = "Mi")
+    #  ?mediate
+    
+    ACME[i, ] <- c(med$d0, med$d0.ci[1], med$d0.ci[2], med$d0.p)
+    ADE[i, ] <- c(med$z0, med$z0.ci[1], med$z0.ci[2], med$z0.p)
+    PM[i, ] <- c(med$n0, med$n0.ci[1], med$n0.ci[2], med$n0.p)
+    TE[i, ] <- c(med$tau.coef, med$tau.ci[1], med$tau.ci[2], med$tau.p)
+  }
+  
+  ACME <- as.data.frame(ACME)
+  ADE <- as.data.frame(ADE)
+  PM <- as.data.frame(PM)
+  TE <- as.data.frame(TE)
+  xm <- as.data.frame(xm)
+  my <- as.data.frame(my)
+  
+  colnames(ACME) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(ADE) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(PM) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(TE) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(xm) <- c("Estimate", "Std.Error", "t.Value", "pValue")
+  colnames(my) <- c("Estimate", "Std.Error", "t.Value", "pValue")
+  
+  ACME$CpG <- colnames(M)
+  ADE$CpG <- colnames(M)
+  PM$CpG <- colnames(M)
+  TE$CpG <- colnames(M)
+  xm$CpG <- colnames(M)
+  my$CpG <- colnames(M)
+  
+  return(list(ACME = ACME,
+              ADE = ADE,
+              PM = PM,
+              TE = TE,
+              xm = xm,
+              my = my))
+  
+}
+
+################################################################################
+# Lu_wrap_mediation_AMR
+#------------------------------------------------------------------------------#
+
+Lu_wrap_mediation_AMR <- function(X, Y, AMR,  conf1 = NULL, conf2 = NULL,U = NULL, sims = 3) {
+  
+  DMR <- AMR
+  
+  ACME <- matrix(ncol = 4, nrow = ncol(DMR))
+  ADE <- matrix(ncol = 4, nrow = ncol(DMR))
+  PM <- matrix(ncol = 4, nrow = ncol(DMR))
+  TE <- matrix(ncol = 4, nrow = ncol(DMR))
+  
+  # from linear models
+  xm <- matrix(ncol = 4, nrow = ncol(DMR))
+  my <- matrix(ncol = 4, nrow = ncol(DMR))
+  
+  for (i in 1:ncol(DMR)) {
+    
+    dat.x <- data.frame(X = X, Mi = DMR[, i], covar = cbind(conf1,U))
+    dat.y <- data.frame(X = X, Mi = DMR[, i], covar = cbind(conf2,U), Y = Y)
+    
+    mod1 <- stats::lm(Mi ~ X + ., data = dat.x)
+    mod2 <- stats::lm(Y ~ X + Mi + ., data = dat.y)
+    
+    # for linear models
+    xm[i, ] <- summary(mod1)$coeff[2, ] # effect of X
+    my[i, ] <- summary(mod2)$coeff[3, ] # effect of M
+    
+    med <- mediation::mediate(mod1, mod2, sims = sims, treat = "X", mediator = "Mi")
+    
+    ACME[i, ] <- c(med$d0, med$d0.ci[1], med$d0.ci[2], med$d0.p)
+    ADE[i, ] <- c(med$z0, med$z0.ci[1], med$z0.ci[2], med$z0.p)
+    PM[i, ] <- c(med$n0, med$n0.ci[1], med$n0.ci[2], med$n0.p)
+    TE[i, ] <- c(med$tau.coef, med$tau0.ci[1], med$tau0.ci[2], med$tau.p)
+  }
+  
+  ACME <- as.data.frame(ACME)
+  ADE <- as.data.frame(ADE)
+  PM <- as.data.frame(PM)
+  TE <- as.data.frame(TE)
+  xm <- as.data.frame(xm)
+  my <- as.data.frame(my)
+  
+  colnames(ACME) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(ADE) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(PM) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(TE) <- c("est", "CI_2.5", "CI_97.5", "pval")
+  colnames(xm) <- c("Estimate", "Std.Error", "t.Value", "pValue")
+  colnames(my) <- c("Estimate", "Std.Error", "t.Value", "pValue")
+  
+  ACME$DMR <- colnames(DMR)
+  ADE$DMR <- colnames(DMR)
+  PM$DMR <- colnames(DMR)
+  TE$DMR <- colnames(DMR)
+  xm$DMR <- colnames(DMR)
+  my$DMR <- colnames(DMR)
+  
+  return(list(ACME = ACME,
+              ADE = ADE,
+              PM = PM,
+              TE = TE,
+              xm = xm,
+              my = my))
+  
+}
+
+################################################################################
+## Overall indirect effect estimation    
+#------------------------------------------------------------------------------#
+# C1 : set of covariates for xm regression
+# C2 : set of covariates for xmy regression
+# U : latent factors
+
+est_oie2 <- function(X, m, Y, C1, C2, U, boots = 100, seed = NULL) {
+  
+  if(!is.null(seed)) set.seed( seed )
+  #  X = expo
+  #  m = mediators
+  #  Y = outcome
+  #  C1 = covar_xm
+  #  C2 = covar_xmy
+  #  U = U
+  #  boots = 100
+  
+  # bootstrap
+  acme_sum <- matrix(nrow = 1, ncol = boots)
+  
+  for (i in 1:ncol(acme_sum)) {
+    #i = 1
+    samp <- sample(length(X), replace = T)
+    
+    # effet B m -> Y
+    dat.1 <- data.frame(X, m, cbind(U,C2))
+    mod1 <- lm(Y[samp] ~ ., data = dat.1[samp, ])
+    B <- as.data.frame(summary(mod1)$coeff[3:(ncol(m) + 2), ])
+    
+    # effet A X -> M
+    dat.2 <- data.frame(X, cbind(U,C1))
+    mod2 <- lm(m[samp, ] ~ ., data = dat.2[samp, ])
+    A <- t(sapply(summary(mod2), function(x) x$coeff[2, ]))
+    A <- data.frame(CpG = rownames(A), A)
+    # A <- separate(A, CpG, c("0", "CpG"), " ")[, -1]
+    
+    colnames(B) <- c("B", "B_sd", "B_tv", "B_pv")
+    colnames(A)[2:5] <- c("A", "A_sd", "A_tv", "A_pv")
+    
+    ab <- cbind(A, B)
+    rownames(ab) <- NULL
+    
+    # effet A*B
+    ab$AB <- ab$A * ab$B
+    
+    acme_sum[i] <- sum(ab$AB)
+  }
+  
+  # Estimate direct effect
+  data_direct <- data.frame(X = X, Y = Y, M = m, cbind(U,C2))
+  mod_direct <- lm(Y ~ ., data = data_direct)
+  ode <- c(summary(mod_direct)$coefficients["X",], confint(mod_direct)[2,])
+  
+  # Estimate total effect
+  data_total <- cbind(X = X, Y = Y, C2)
+  mod_total <- lm(Y ~ ., data = data_total)
+  ote <- c(summary(mod_total)$coefficients["X",], confint(mod_total)[2,])
+
+  # results as list
+  
+  return(list(oie = as.vector(acme_sum), ote = ote, ode = ode))
+}
+
+################################################################################
+# DMR annotation
+#------------------------------------------------------------------------------#
+
+simplifyGeneName <- function(name){ 
+  name <- stringr::str_split(name, pattern = ";", simplify = T)
+  name <- unique(c(name))
+  name <- name[stringi::stri_order(name)]
+  name <- paste0(name, collapse = ";")
+  return( name )
+}
+
+seekNewAnnot <- function(dmrs, 
+                         genes, 
+                         gene.lab = "geneName", verbose = TRUE){
+  
+  dmrs.unknown <- dplyr::filter(dmrs, geneName == "")
+  
+  if( nrow(dmrs.unknown)>0 ){
+    dmrs.gr <- GRanges(seqnames = dmrs.unknown$chr, 
+                       ranges = IRanges(start = dmrs.unknown$start, end = dmrs.unknown$end),
+                       strand = "*")
+    
+    seqlevelsStyle(genes) <- seqlevelsStyle(dmrs.gr) <- "UCSC"
+    
+    overlaps <- findOverlaps(query = dmrs.gr, subject = genes, ignore.strand = TRUE)
+    
+    if(length(overlaps)>0){
+      
+      if(verbose) cat("New annotation found!! \n") 
+      
+      gene.id <- genes$gene_id[subjectHits(overlaps)]
+      gene.names <- genes$gene_name[subjectHits(overlaps)]
+      for(i in seq_along(gene.names)) if(is.na(gene.names[i]) | gene.names[i]=="") gene.names[i] <- gene.id[i]
+      
+      dmrs.unknown[queryHits(overlaps),"geneName"] <- gene.names
+      
+      dmrs <- rbind.data.frame(dplyr::filter(dmrs, geneName != ""), dmrs.unknown)
+    }
+  }
+  return( dmrs )
+}
+
+getLocations <- function(loc.vector, sep = ";"){
+  
+  locations <- tapply(loc.vector, seq_along(loc.vector),
+                      FUN = function(s) stringr::str_split(s, pattern = sep, simplify = T))
+  locations <- unlist(locations)
+  locations <- unique(locations)
+  locations <- locations[stringi::stri_order(locations)]
+  locations <- paste0(locations, collapse = ";")
+  
+  return(locations)
+}
